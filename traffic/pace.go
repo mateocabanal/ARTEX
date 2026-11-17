@@ -35,6 +35,9 @@ func (s *sink) Requestheaders(f *mproxy.Flow) {
 	if f.Request.Method == http.MethodConnect || f.Request.URL == nil {
 		return
 	}
+	// The recorder and target see the same operator-defined request identity.
+	// CONNECT is excluded: only actual target HTTP requests are identified.
+	egress.ApplyTargetIdentity(f.Request.Header)
 	if _, marked := s.paced.Load(id); marked {
 		pace(f)
 	}

@@ -325,6 +325,8 @@ const (
 	// Target noise profile (off|quiet|balanced|aggressive). When stored it wins over
 	// ARTEX_NOISE_PROFILE, which stays the fallback; applied at startup and on PUT.
 	settingNoiseProfile = "noise_profile"
+	// Target request identity (visible User-Agent and allowlisted custom headers).
+	settingTargetIdentity = "target_identity"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -423,6 +425,10 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
 	egress.SetProfile(startupNoiseProfile(pg))
+	if err := egress.SetTargetIdentity(startupTargetIdentity(pg)); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("startup target identity: %w", err)
+	}
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
 	}

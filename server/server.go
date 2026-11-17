@@ -3698,7 +3698,9 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_summary_max_runes": limits.SummaryRunes,
 		"notify_assets_max_shown":  limits.AssetsShown,
 		// Effective target noise profile (off by default): the stored setting, else ARTEX_NOISE_PROFILE.
-		"noise_profile": egress.CurrentProfile().Name,
+		"noise_profile":     egress.CurrentProfile().Name,
+		"target_user_agent": egress.CurrentTargetIdentity().UserAgent,
+		"target_headers":    egress.CurrentTargetIdentity().Headers,
 	}
 }
 
@@ -3778,10 +3780,43 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyAssetsMaxShown  *int `json:"notify_assets_max_shown"`
 		// Target noise profile: off|quiet|balanced|aggressive; null = unchanged. Applies to the next request, no agent rebuild.
 		NoiseProfile *string `json:"noise_profile"`
+		// Explicit identification of authorized assessment requests. A nil field leaves
+		// the saved value unchanged, an empty string/map clears it.
+		TargetUserAgent *string            `json:"target_user_agent"`
+		TargetHeaders   *map[string]string `json:"target_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	// Validate request identity before changing any other setting. Store it
+	// atomically as a single JSON document, so headers and UA stay in sync.
+	if req.TargetUserAgent != nil || req.TargetHeaders != nil {
+		identity := egress.CurrentTargetIdentity()
+		if req.TargetUserAgent != nil {
+			identity.UserAgent = *req.TargetUserAgent
+		}
+		if req.TargetHeaders != nil {
+			identity.Headers = *req.TargetHeaders
+		}
+		validated, err := egress.ValidateTargetIdentity(identity)
+		if err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		stored, err := json.Marshal(validated)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTargetIdentity, string(stored)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if err := egress.SetTargetIdentity(validated); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	// Validated before any other field is written, so a bad value changes nothing.
 	var noise egress.Profile

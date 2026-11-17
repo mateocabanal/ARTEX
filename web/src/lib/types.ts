@@ -1019,6 +1019,9 @@ export interface Settings {
   notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
   // Target noise profile; the stored setting wins over ARTEX_NOISE_PROFILE. Applies to the next request.
   noise_profile?: NoiseProfileName;
+  // Visible identity tags for target HTTP traffic; not credentials.
+  target_user_agent?: string;
+  target_headers?: Record<string, string>;
 }
 
 export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";

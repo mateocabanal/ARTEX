@@ -416,7 +416,13 @@ func (g *Governor) Transport(namespace string, base http.RoundTripper) http.Roun
 		base = http.DefaultTransport
 	}
 	if g.off() {
-		return base
+		// An explicit request identity still applies when noise pacing is off.
+		// The unconfigured default remains a strict passthrough.
+		i := targetIdentity.Load()
+		if i == nil || (i.UserAgent == "" && len(i.Headers) == 0) {
+			return base
+		}
+		return identityTransport{base}
 	}
 	return &transport{g, namespace, base}
 }
@@ -425,6 +431,14 @@ type transport struct {
 	g         *Governor
 	namespace string
 	base      http.RoundTripper
+}
+
+// identityTransport is used only when noise is off and an identity is enabled.
+// It performs no pacing, caching or retries.
+type identityTransport struct{ base http.RoundTripper }
+
+func (t identityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.base.RoundTrip(withTargetIdentity(req))
 }
 
 // Dynamic returns base (nil: http.DefaultTransport) governed by the governor
@@ -449,6 +463,7 @@ func (d dynamicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 const maxSharedBody = 2 << 20 // a larger response is neither coalesced nor cached
 
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = withTargetIdentity(req)
 	if ua := t.g.p.UserAgent; ua != "" && req.Header.Get("User-Agent") == "" {
 		req = req.Clone(req.Context())
 		req.Header.Set("User-Agent", ua)

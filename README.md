@@ -442,6 +442,20 @@ every case.
 The **Target noise** card in System settings sets the profile at runtime (no restart) and shows the
 per-host counters; once saved, that setting takes precedence over `ARTEX_NOISE_PROFILE`.
 
+**Target request identity (fork feature):** In **System → Settings → Target request identity**,
+configure a persistent User-Agent and up to 16 custom HTTP headers, such as
+`User-Agent: ARTEX-Authorized/1.0` and `X-Assessment-ID: authorized-engagement-123`.
+The values are visible identifiers, **not secrets or credentials**. They override
+matching request headers and apply to ARTEX-owned target HTTP transports and HTTP
+requests passing through the recording MITM proxy, regardless of the noise
+profile. Direct scanners, WebFetch in direct mode, TLS passthrough, and third-party
+tools that bypass the recording proxy are **not universally covered**. Enable
+traffic capture/proxying when you need a consistent HTTP signature for those tools.
+Authorization/Cookie/Host, hop-by-hop and framing headers cannot be customized.
+This is global to the deployment (per-engagement overrides are not yet available);
+only configure it for engagements where all destinations are approved. Changing
+the identity does not grant permission or enforce network scope.
+
 **Low-and-slow agent guidance (off by default)**: when a noise profile is set, the planner, worker,
 main agent and chat agents receive a code-owned prompt block with the profile's per-host limits and
 exact rate/delay flags for the installed scanners. It tells them to test one host at a time, back
