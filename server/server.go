@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -53,6 +54,16 @@ type Server struct {
 
 	setupMu    sync.Mutex
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
+	// pwdVersion is auth.password_version, a counter. Zero means no password
+	// change is stored yet, and any valid token is accepted. pwdState is
+	// pwdUnreadable when that counter could not be read; every session is
+	// rejected until login reads it again.
+	pwdVersion atomic.Int64
+	pwdState   atomic.Int32
+	// authHashKey and authVersionKey override the settings keys. Empty uses
+	// the production keys. Tests set unique keys so a shared database is left alone.
+	authHashKey    string
+	authVersionKey string
 
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
 	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
@@ -117,7 +128,9 @@ type Server struct {
 	// It deliberately lives OUTSIDE the provider caches: rebuilding the chain
 	// (saving an unrelated profile, flipping a setting) must not erase what we
 	// learned about which backends are out of credit / rate-limited.
-	llmHealth *llmpool.Registry
+	// llmHealthSync flushes that state when ctx is cancelled, before the database closes.
+	llmHealth     *llmpool.Registry
+	llmHealthSync *healthSync
 
 	// Explicit task chains use one task-scoped dynamic provider shared by goals,
 	// planner, workers, and the main agent. Bundles are stable; their runtime reads
@@ -163,13 +176,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
+		provByProfile:  map[int64]*provEntry{},
+		taskAgents:     map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
 		loginLimit: newLoginLimiter(time.Now)}
+	s.llmHealth, s.llmHealthSync = newLLMHealthRegistry(ctx, m.pg)
 	for _, o := range opts {
 		o(s)
 	}
 	s.initSetupToken()
+	s.loadPasswordVersion()
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
@@ -296,8 +311,15 @@ func (s *Server) restoreTaskRuntimes() {
 		lifecycle := t.lifecycleSnapshot()
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
-		if n, _ := t.Store.ResetRunningIntents(); n > 0 {
+		if n, err := t.Store.ResetRunningIntents(); err != nil {
+			log.Printf("[engine] task %s reset leftover running intents: %v", t.ID, err)
+		} else if n > 0 {
 			log.Printf("[engine] task %s reset %d leftover running intents to open", t.ID, n)
+		}
+		if n, err := t.Store.FlushActivityOutbox(); err != nil {
+			log.Printf("[activity] task %s outbox: %v", t.ID, err)
+		} else if n > 0 {
+			log.Printf("[activity] task %s stored %d activities recovered from the outbox", t.ID, n)
 		}
 		if lifecycle.Paused {
 			s.engine.Pause(t.ID, agent.AbortPausedOnReload)
@@ -317,6 +339,30 @@ func (s *Server) restoreTaskRuntimes() {
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
 		}
+	}
+}
+
+// Wait blocks until the task goroutines snapshotted now, and the archive
+// worker, have finished, or until ctx ends.
+func (s *Server) Wait(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if s.engine != nil {
+		if err := s.engine.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		s.archiveWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -802,6 +848,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("POST /api/exploration/findings/bulk-status", s.bulkPatchFindingStatus)
+	mux.HandleFunc("POST /api/exploration/findings/bulk-report-state", s.bulkPatchFindingReportState)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
@@ -996,7 +1043,7 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return root
+	return limitRequestBody(root)
 }
 
 // --- handlers ---
@@ -1005,7 +1052,7 @@ func (s *Server) Handler() http.Handler {
 // with a valid token gets the service name and version; the web UI's top bar
 // reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !s.sessionOK(extractToken(r)) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
@@ -2321,7 +2368,7 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 //	format  = md-single (one combined .md) | md-zip (one .md per vulnerability, zipped)
 //	          | csv | json
 //	ids     = comma-separated finding ids (required when scope=selected)
-//	Filter params severity/status/vulnclass/task_id/q/sort match the list endpoint (used when scope=filtered).
+//	Filter params severity/status/report_state/vulnclass/task_id/q/sort match the list endpoint (used when scope=filtered).
 func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
@@ -2486,17 +2533,18 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Status    *string `json:"status"`
-		Severity  *string `json:"severity"`
-		Name      *string `json:"name"`
-		VulnClass *string `json:"vulnclass"`
+		Status      *string `json:"status"`
+		ReportState *string `json:"report_state"`
+		Severity    *string `json:"severity"`
+		Name        *string `json:"name"`
+		VulnClass   *string `json:"vulnclass"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
-		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass")
+	if body.Status == nil && body.ReportState == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
+		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/report_state")
 		return
 	}
 	if body.Status != nil {
@@ -2518,6 +2566,21 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		}
 		if !notified && from != *body.Status {
 			log.Printf("[notify] status-change event not registered finding=%d %s→%s (status was updated)", id, from, *body.Status)
+		}
+	}
+	if body.ReportState != nil {
+		if !db.ValidFindingReportState(*body.ReportState) {
+			writeErr(w, 400, "bad report_state: "+*body.ReportState)
+			return
+		}
+		n, err := s.m.pg.SetFindingReportState(id, *body.ReportState)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
 		}
 	}
 	if body.Severity != nil {
@@ -2591,23 +2654,67 @@ func (s *Server) bulkPatchFindingStatus(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 400, "bad status: "+body.Status)
 		return
 	}
-	seen := make(map[int64]bool, len(body.IDs))
-	ids := make([]int64, 0, len(body.IDs))
-	for _, id := range body.IDs {
-		if id <= 0 || seen[id] {
-			continue
-		}
-		seen[id] = true
-		ids = append(ids, id)
-		if len(ids) == maxBulkFindingStatus {
-			break
-		}
-	}
+	ids := normalizeFindingIDs(body.IDs, maxBulkFindingStatus)
 	if len(ids) == 0 {
 		writeErr(w, 400, "no finding ids")
 		return
 	}
 	results, err := s.m.pg.SetFindingStatusesWithNotify(r.Context(), ids, body.Status)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	updated, missing := 0, 0
+	for _, res := range results {
+		if res.Changed {
+			updated++
+		}
+		if !res.Found {
+			missing++
+		}
+	}
+	writeJSON(w, 200, map[string]any{"updated": updated, "missing": missing, "results": results})
+}
+
+// normalizeFindingIDs drops non-positive and duplicate ids, then caps the list.
+func normalizeFindingIDs(ids []int64, capN int) []int64 {
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if capN > 0 && len(out) == capN {
+			break
+		}
+	}
+	return out
+}
+
+// bulkPatchFindingReportState sets the same report stage on a batch of findings
+// in one transaction. Same cap/dedupe/per-id result as bulk status, without
+// status-change notifications: report_state is a workflow stage, not a verdict.
+func (s *Server) bulkPatchFindingReportState(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs         []int64 `json:"ids"`
+		ReportState string  `json:"report_state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	if !db.ValidFindingReportState(body.ReportState) {
+		writeErr(w, 400, "bad report_state: "+body.ReportState)
+		return
+	}
+	ids := normalizeFindingIDs(body.IDs, maxBulkFindingStatus)
+	if len(ids) == 0 {
+		writeErr(w, 400, "no finding ids")
+		return
+	}
+	results, err := s.m.pg.SetFindingReportStates(r.Context(), ids, body.ReportState)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -3210,6 +3317,11 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "streaming unsupported")
 		return
 	}
+	tok := extractToken(r)
+	if !s.sessionOK(tok) {
+		writeErr(w, 401, "token is invalid or expired")
+		return
+	}
 	since := int64(atoiDefault(r.URL.Query().Get("since"), 0))
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -3225,6 +3337,9 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	lines, cursor := logSink.recent(since, 1000)
 	for _, l := range lines {
+		if !s.sessionOK(tok) {
+			return
+		}
 		send(l)
 	}
 	if cursor > since {
@@ -3240,7 +3355,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case l, ok := <-ch:
-			if !ok {
+			if !ok || !s.sessionOK(tok) {
 				return
 			}
 			if l.Seq <= since {
@@ -3249,6 +3364,9 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 			since = l.Seq
 			send(l)
 		case <-ping.C:
+			if !s.sessionOK(tok) {
+				return
+			}
 			fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		}
@@ -3256,6 +3374,11 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
+	tok := extractToken(r)
+	if !s.sessionOK(tok) {
+		writeErr(w, 401, "token is invalid or expired")
+		return
+	}
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
 	if t == nil {
 		writeErr(w, 404, "task not found")
@@ -3316,6 +3439,9 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, a := range items {
+			if !s.sessionOK(tok) {
+				return
+			}
 			sendSSE(a)
 		}
 		if cursor > since {
@@ -3335,7 +3461,7 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case a, ok := <-ch:
-			if !ok {
+			if !ok || !s.sessionOK(tok) {
 				return
 			}
 			if a.ID <= since {
@@ -3347,6 +3473,9 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 			since = a.ID
 			sendSSE(a)
 		case <-ping.C:
+			if !s.sessionOK(tok) {
+				return
+			}
 			fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		}
