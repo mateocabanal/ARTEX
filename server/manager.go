@@ -23,6 +23,7 @@ import (
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/managedproxy"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/traffic/rewrite"
 	actool "github.com/Autumn-27/norma/tool"
@@ -290,7 +291,9 @@ type Manager struct {
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
-	globalProxy string
+	globalProxy     string
+	proxyPool       *managedproxy.Pool
+	proxyPoolCancel context.CancelFunc
 }
 
 // Settings keys the UI toggles at runtime.
@@ -326,7 +329,8 @@ const (
 	// ARTEX_NOISE_PROFILE, which stays the fallback; applied at startup and on PUT.
 	settingNoiseProfile = "noise_profile"
 	// Target request identity (visible User-Agent and allowlisted custom headers).
-	settingTargetIdentity = "target_identity"
+	settingTargetIdentity   = "target_identity"
+	settingManagedProxyPool = "managed_proxy_pool"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -437,7 +441,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	// Behind the global egress proxy a target approval is name-only.
-	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.GlobalProxy() != "" })
+	m.interceptor.SetUpstreamProxyCheck(func() bool {
+		return m.GlobalProxy() != "" || m.proxyPool != nil && m.proxyPool.Enabled()
+	})
 	// The platform's own endpoints need no target approval.
 	m.interceptor.SetDerivedExemptions(m.targetGateEndpoints)
 	if proxyAddr != "" {
@@ -466,12 +472,6 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		if tr != nil {
 			m.traffic = tr
 			m.reloadRewriteRules() // in place before the proxy accepts a connection
-			go func() {
-				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
-				if err := tr.Start(); err != nil {
-					log.Printf("[traffic] proxy stopped: %v", err)
-				}
-			}()
 		}
 	}
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
@@ -509,6 +509,42 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] global proxy %q invalid, ignored: %v", m.globalProxy, err)
 		}
 	}
+	m.proxyPool = managedproxy.New()
+	if raw, ok, err := pg.GetSetting(settingManagedProxyPool); err != nil {
+		_ = m.Close()
+		return nil, fmt.Errorf("load managed proxy pool: %w", err)
+	} else if ok {
+		var cfg managedproxy.Config
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			_ = m.Close()
+			return nil, fmt.Errorf("decode managed proxy pool: %w", err)
+		}
+		if err := m.proxyPool.Configure(cfg); err != nil {
+			_ = m.Close()
+			return nil, fmt.Errorf("invalid managed proxy pool: %w", err)
+		}
+	}
+	if m.proxyPool.Enabled() && (!m.trafficOn || m.traffic == nil) {
+		_ = m.Close()
+		return nil, errors.New("managed proxy pool requires active traffic capture and a recording proxy")
+	}
+	if m.traffic != nil {
+		m.traffic.SetUpstreamSelector(m.managedProxySelector())
+		m.traffic.SetTargetPolicy(func(host string) error { return m.proxyPool.AllowHost(host) })
+	}
+	// Do not accept traffic until the managed proxy policy has been loaded:
+	// a startup race here could otherwise send requests directly.
+	if tr := m.traffic; tr != nil {
+		go func() {
+			log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
+			if err := tr.Start(); err != nil {
+				log.Printf("[traffic] proxy stopped: %v", err)
+			}
+		}()
+	}
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+	m.proxyPoolCancel = poolCancel
+	go m.proxyPool.Run(poolCtx)
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
@@ -527,6 +563,9 @@ func (m *Manager) TrafficEnabled() bool {
 // SetTrafficEnabled persists and applies the traffic-capture toggle. Callers must
 // rebuild the agents (applyLLM) afterwards so the new proxy/tools/prompt take hold.
 func (m *Manager) SetTrafficEnabled(on bool) error {
+	if !on && m.proxyPool != nil && m.proxyPool.Enabled() {
+		return errors.New("disable the managed proxy pool before turning off traffic capture")
+	}
 	if err := m.pg.SetBool(settingTrafficCapture, on); err != nil {
 		return err
 	}
@@ -881,6 +920,9 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	if m.proxyPoolCancel != nil {
+		m.proxyPoolCancel()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
@@ -965,6 +1007,11 @@ func (m *Manager) targetGateEndpoints() []string {
 	on, backend, _, _, _, searchProxy := m.WebSearch()
 	if on {
 		out = append(out, searchBackendEndpoints[backend])
+	}
+	if m.proxyPool != nil {
+		for _, proxy := range m.proxyPool.Config().Proxies {
+			out = append(out, proxy.URL)
+		}
 	}
 	return append(out, searchProxy, m.ProxyAddr(), m.GlobalProxy())
 }

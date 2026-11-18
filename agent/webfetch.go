@@ -26,7 +26,11 @@ func withWebFetch(ctx context.Context, tools []actool.CoreTool, proxy, caCert st
 	scope, scoped := intercept.TargetScopeFromContext(ctx)
 	gated := scoped && scope.Enabled != nil && scope.Enabled()
 	webFetch := actool.NewWebFetch(actool.WebFetchConfig{Proxy: proxy, CACert: caCert, CheckRedirect: intercept.RedirectCheck("WebFetch"),
-		DialContext: intercept.PinnedDialer("WebFetch", scoped), DisableDirectRetry: gated})
+		DialContext: intercept.PinnedDialer("WebFetch", scoped),
+		// An explicitly configured proxy must not be bypassed on a proxy error.
+		// The managed pool is upstream of the recording proxy; a direct retry
+		// would evade its allowlist and its fail-closed guarantee.
+		DisableDirectRetry: gated || proxy != ""})
 	return append(tools[:len(tools):len(tools)], governedFetch{webFetch})
 }
 

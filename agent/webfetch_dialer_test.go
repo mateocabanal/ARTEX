@@ -221,10 +221,9 @@ func TestWebFetchProxiedDialIsTheProxy(t *testing.T) {
 	}
 }
 
-// D-8: a run built with the gate off keeps its direct retry when the gate is
-// switched on during the run, and the retry goes through the pinned dialer: a
-// pinned target is dialled at its pinned address, an unpinned one nowhere.
-func TestWebFetchRetryAfterLiveSwitchIsPinned(t *testing.T) {
+// A configured proxy never silently falls back to a direct origin connection
+// after a proxy failure, even if the scope gate is toggled after agent creation.
+func TestWebFetchConfiguredProxyNeverRetriesDirect(t *testing.T) {
 	d := testDB(t)
 	t.Cleanup(func() { _ = d.Close() })
 	f := newHookReachFixture(t)
@@ -239,24 +238,19 @@ func TestWebFetchRetryAfterLiveSwitchIsPinned(t *testing.T) {
 	res.set("b.example", "203.0.113.8")
 	ctx := intercept.WithTargetScope(t.Context(), scope)
 	tools := withWebFetch(ctx, nil, "http://127.0.0.1:1", "")
-
 	on.Store(true)
 	pinTarget(t, d, scope, "http://a.example:"+port+"/")
-	call := func(u string) (string, bool) {
-		r, err := tools[0].Call(ctx, json.RawMessage(fetchInputJSON(u)), &actool.ToolContext{})
+	for _, host := range []string{"a.example", "b.example"} {
+		r, err := tools[0].Call(ctx, json.RawMessage(fetchInputJSON("http://"+host+":"+port+"/")), &actool.ToolContext{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return r.Flatten(), r.IsError
+		if !r.IsError || hits.Load() != 0 {
+			t.Fatalf("configured proxy was bypassed for %s: error=%v hits=%d", host, r.IsError, hits.Load())
+		}
 	}
-	if out, isErr := call("http://a.example:" + port + "/"); isErr || !strings.Contains(out, "retry-reached") || hits.Load() != 1 {
-		t.Fatalf("pinned target through the retry: error=%v out=%q", isErr, out)
-	}
-	if out, isErr := call("http://b.example:" + port + "/"); !isErr || !strings.Contains(out, intercept.TargetApprovalPending) || hits.Load() != 1 {
-		t.Fatalf("unpinned target through the retry: error=%v out=%q", isErr, out)
-	}
-	want := []string{"127.0.0.1:1", "203.0.113.7:" + port, "127.0.0.1:1"}
+	want := []string{"127.0.0.1:1", "127.0.0.1:1"}
 	if got := dialer.calls(); !slices.Equal(got, want) {
-		t.Fatalf("dialled %v, want %v", got, want)
+		t.Fatalf("dialled %v, want proxy only %v", got, want)
 	}
 }

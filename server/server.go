@@ -839,6 +839,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	mux.HandleFunc("GET /api/settings/noise", s.noiseStatus) // current noise profile + per-host counters (no reset)
+	mux.HandleFunc("GET /api/settings/proxy-pool", s.getManagedProxyPool)
+	mux.HandleFunc("PUT /api/settings/proxy-pool", s.putManagedProxyPool)
+	mux.HandleFunc("POST /api/settings/proxy-pool/check", s.checkManagedProxyPool)
 	// Vulnerability IM push. Channels are "multi-instance + per-instance filter rules" resources, so they get their own group of
 	// REST endpoints instead of being stuffed into the flat /api/settings key-value store.
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
@@ -3972,7 +3975,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TrafficCapture != nil {
 		if err := s.m.SetTrafficEnabled(*req.TrafficCapture); err != nil {
-			writeErr(w, 500, err.Error())
+			writeErr(w, 400, err.Error())
 			return
 		}
 		changed = true

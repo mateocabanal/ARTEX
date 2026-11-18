@@ -35,6 +35,16 @@ func (s *sink) Requestheaders(f *mproxy.Flow) {
 	if f.Request.Method == http.MethodConnect || f.Request.URL == nil {
 		return
 	}
+	if s.t != nil {
+		if err := s.t.checkTargetHost(f.Request.URL.Hostname()); err != nil {
+			f.Response = &mproxy.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       []byte("managed proxy policy blocked request"),
+			}
+			return
+		}
+	}
 	// The recorder and target see the same operator-defined request identity.
 	// CONNECT is excluded: only actual target HTTP requests are identified.
 	egress.ApplyTargetIdentity(f.Request.Header)

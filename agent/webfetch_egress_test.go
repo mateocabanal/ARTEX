@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -42,5 +44,25 @@ func TestWebFetchProfileDoesNotCache(t *testing.T) {
 	if checks.Load() != 2 || pair.startHits.Load() != 2 || pair.finalHits.Load() != 2 {
 		t.Fatalf("redirect checks %d, start hits %d, final hits %d; want 2 each (no cache hit)",
 			checks.Load(), pair.startHits.Load(), pair.finalHits.Load())
+	}
+}
+
+// A configured upstream proxy is a routing commitment, not a hint. WebFetch
+// must never bypass a failed proxy by trying the target directly. This test
+// needs no PostgreSQL and runs against a local HTTP server only.
+func TestWebFetchNoDirectFallbackWithoutDatabase(t *testing.T) {
+	var hits atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("should-not-be-reached"))
+	}))
+	defer target.Close()
+	tools := withWebFetch(t.Context(), nil, "http://127.0.0.1:1", "")
+	res, err := tools[0].Call(t.Context(), json.RawMessage(fetchInputJSON(target.URL)), &actool.ToolContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || hits.Load() != 0 || strings.Contains(res.Flatten(), "should-not-be-reached") {
+		t.Fatalf("WebFetch bypassed configured proxy: tool error=%v target hits=%d", res.IsError, hits.Load())
 	}
 }

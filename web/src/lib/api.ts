@@ -876,6 +876,9 @@ export const api = {
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
   noiseStatus: () => get<import("@/lib/types").NoiseStatus>(`/settings/noise`),
+  managedProxyStatus: () => get<import("@/lib/types").ManagedProxyStatus>(`/settings/proxy-pool`),
+  setManagedProxyPool: (config: import("@/lib/types").ManagedProxyConfig) => put<import("@/lib/types").ManagedProxyStatus>(`/settings/proxy-pool`, config),
+  checkManagedProxyPool: () => post<import("@/lib/types").ManagedProxyStatus>(`/settings/proxy-pool/check`, {}),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;

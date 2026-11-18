@@ -456,6 +456,17 @@ This is global to the deployment (per-engagement overrides are not yet available
 only configure it for engagements where all destinations are approved. Changing
 the identity does not grant permission or enforce network scope.
 
+**Managed proxy pool (fork feature):** In **System → Settings → Managed proxy pool**,
+register up to eight **operator-owned or explicitly authorized** HTTP/HTTPS/SOCKS5
+upstreams, configure exact allowed target hostnames, and enable Traffic capture.
+The recording proxy then routes allowed targets through a sticky, healthy upstream:
+5-minute endpoint reachability checks, manual refresh, failover after a failed
+health check, per-node selection counters, and **no direct fallback** while
+enabled. Proxy credentials are encrypted at rest and omitted from API responses.
+The pool has no import/rotation of public proxy lists; it does not automatically
+apply to unproxied scanners/tools, and the target gate remains independently
+responsible for approval. See [Managed proxy pool](docs/MANAGED_PROXY_POOL.md).
+
 **Low-and-slow agent guidance (off by default)**: when a noise profile is set, the planner, worker,
 main agent and chat agents receive a code-owned prompt block with the profile's per-host limits and
 exact rate/delay flags for the installed scanners. It tells them to test one host at a time, back

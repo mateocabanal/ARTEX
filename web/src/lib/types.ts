@@ -1026,6 +1026,36 @@ export interface Settings {
 
 export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";
 
+export interface ManagedProxyNode {
+  id: string;
+  name: string;
+  url: string;
+  authorized: boolean;
+}
+export interface ManagedProxyConfig {
+  enabled: boolean;
+  allowed_hosts: string[];
+  proxies: ManagedProxyNode[];
+}
+export interface ManagedProxyNodeStatus extends ManagedProxyNode {
+  has_credentials: boolean;
+  healthy: boolean;
+  checked_at?: string;
+  latency_ms: number;
+  reason?: string;
+  selections: number;
+  failovers: number;
+}
+export interface ManagedProxyStatus {
+  enabled: boolean;
+  allowed_hosts: string[];
+  proxies: ManagedProxyNodeStatus[];
+  check_interval_seconds: number;
+  bound_hosts: number;
+  admitted_requests: number;
+  blocked_requests: number;
+}
+
 // GET /api/settings/noise: the current profile and its per-host counters (current minute, no reset).
 export interface NoiseStatus {
   profile: NoiseProfileName;

@@ -17,6 +17,7 @@ import type { Settings } from "@/lib/types";
 
 import { NoiseProfileCard } from "./noise-profile-card";
 import { TargetIdentityCard } from "./target-identity-card";
+import { ManagedProxyPoolCard } from "./managed-proxy-pool-card";
 
 export default function SystemSettingsPage() {
   const [trafficCapture, setTrafficCapture] = React.useState(false);
@@ -316,6 +317,8 @@ export default function SystemSettingsPage() {
         <NoiseProfileCard />
 
         <TargetIdentityCard />
+
+        <ManagedProxyPoolCard trafficCapture={trafficCapture} />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
