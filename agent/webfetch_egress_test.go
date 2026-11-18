@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,9 +48,9 @@ func TestWebFetchProfileDoesNotCache(t *testing.T) {
 	}
 }
 
-// A configured upstream proxy is a routing commitment, not a hint. WebFetch
-// must never bypass a failed proxy by trying the target directly. This test
-// needs no PostgreSQL and runs against a local HTTP server only.
+// When the Managed Proxy Pool is enabled, an already-built WebFetch tool
+// must fail closed on proxy failure; normal ARTEX retry remains unchanged when
+// the managed policy is off. This test is database-free and loopback-only.
 func TestWebFetchNoDirectFallbackWithoutDatabase(t *testing.T) {
 	var hits atomic.Int64
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,12 +58,42 @@ func TestWebFetchNoDirectFallbackWithoutDatabase(t *testing.T) {
 		_, _ = w.Write([]byte("should-not-be-reached"))
 	}))
 	defer target.Close()
-	tools := withWebFetch(t.Context(), nil, "http://127.0.0.1:1", "")
-	res, err := tools[0].Call(t.Context(), json.RawMessage(fetchInputJSON(target.URL)), &actool.ToolContext{})
-	if err != nil {
-		t.Fatal(err)
+	const proxy = "http://127.0.0.1:1"
+	tools := withWebFetch(t.Context(), nil, proxy, "")
+	call := func() (actool.Result, error) {
+		return tools[0].Call(t.Context(), json.RawMessage(fetchInputJSON(target.URL)), &actool.ToolContext{})
 	}
-	if !res.IsError || hits.Load() != 0 || strings.Contains(res.Flatten(), "should-not-be-reached") {
-		t.Fatalf("WebFetch bypassed configured proxy: tool error=%v target hits=%d", res.IsError, hits.Load())
+
+	// Our fork must retain upstream's fallback when managed routing is off.
+	before, err := call()
+	if err != nil || before.IsError || hits.Load() != 1 {
+		t.Fatalf("upstream direct retry changed: err=%v isError=%v hits=%d", err, before.IsError, hits.Load())
+	}
+	cleanup := InstallManagedProxyDialGuard(func(configured, addr string) error {
+		if configured != proxy || addr != "127.0.0.1:1" {
+			return errors.New("managed pool prohibits alternate WebFetch egress")
+		}
+		return nil
+	})
+	t.Cleanup(cleanup)
+
+	// Enabling the managed pool must constrain even this existing WebFetch tool.
+	blocked, err := call()
+	if err != nil || !blocked.IsError || hits.Load() != 1 || strings.Contains(blocked.Flatten(), "should-not-be-reached") {
+		t.Fatalf("managed guard bypass: err=%v isError=%v hits=%d", err, blocked.IsError, hits.Load())
+	}
+
+	// A direct/stale agent created while capture was off must not connect.
+	stale := withWebFetch(t.Context(), nil, "", "")
+	staleResult, err := stale[0].Call(t.Context(), json.RawMessage(fetchInputJSON(target.URL)), &actool.ToolContext{})
+	if err != nil || !staleResult.IsError || hits.Load() != 1 {
+		t.Fatalf("stale direct route bypassed pool: err=%v isError=%v hits=%d", err, staleResult.IsError, hits.Load())
+	}
+
+	// Once the policy is disabled, the original retry semantics return.
+	cleanup()
+	after, err := call()
+	if err != nil || after.IsError || hits.Load() != 2 {
+		t.Fatalf("normal ARTEX behavior not restored: err=%v isError=%v hits=%d", err, after.IsError, hits.Load())
 	}
 }

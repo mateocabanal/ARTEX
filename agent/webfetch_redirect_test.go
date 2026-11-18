@@ -189,9 +189,9 @@ func TestWebFetchGatedScopeHasNoDirectRetry(t *testing.T) {
 	}
 }
 
-// Without a proxy, WebFetch retains normal redirects with the gate off.
-// A configured but broken proxy now fails closed rather than retrying direct.
-// No database required.
+// With the gate off, or without a scope, WebFetch follows redirects as it did
+// with agentcore's own tool: to the end of the chain, and the same error after
+// 10 hops. No database.
 func TestWebFetchRedirectGateOffUnchanged(t *testing.T) {
 	pinNoiseOff(t) // a gate-off regression test: independent of ARTEX_NOISE_PROFILE
 	loop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -205,17 +205,12 @@ func TestWebFetchRedirectGateOffUnchanged(t *testing.T) {
 	} {
 		pair := newRedirectPair(t)
 		for _, proxy := range []string{"", "http://127.0.0.1:1"} {
-			out, isErr := callWebFetch(t, ctx, proxy, pair.start)
-			if proxy == "" {
-				if isErr || !strings.Contains(out, "redirect-target-reached") {
-					t.Fatalf("%s direct: error=%v out=%q", name, isErr, out)
-				}
-			} else if !isErr {
-				t.Fatalf("%s broken proxy must not retry direct: out=%q", name, out)
+			if out, isErr := callWebFetch(t, ctx, proxy, pair.start); isErr || !strings.Contains(out, "redirect-target-reached") {
+				t.Fatalf("%s, proxy %q: error=%v out=%q", name, proxy, isErr, out)
 			}
 		}
-		if pair.finalHits.Load() != 1 {
-			t.Fatalf("%s: %d target hits, want only the direct call", name, pair.finalHits.Load())
+		if pair.finalHits.Load() != 2 {
+			t.Fatalf("%s: %d hits on the redirect target, want 2", name, pair.finalHits.Load())
 		}
 		got, _ := callWebFetch(t, ctx, "", loop.URL+"/l")
 		want := actool.NewWebFetch(actool.WebFetchConfig{}).Call

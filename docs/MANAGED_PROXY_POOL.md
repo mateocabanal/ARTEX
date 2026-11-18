@@ -41,7 +41,8 @@ remain in place. Disabling traffic capture while the pool is enabled is rejected
   not claim successful delivery. Health check times/latency reflect proxy
   endpoint reachability only.
 - Pool selection works for requests passing through ARTEX's **recording proxy**.
-  WebFetch with a configured proxy no longer retries direct on failure.
+  With the managed pool enabled, WebFetch's direct retry is denied at dial
+  time; with the pool off, upstream ARTEX's normal retry behavior is unchanged.
   Programs that bypass that proxy, such as raw scanners, independently proxied
   HTTP tools, or direct WebFetch paths, are outside this feature's routing
   guarantees. It does not replace network/firewall egress enforcement or

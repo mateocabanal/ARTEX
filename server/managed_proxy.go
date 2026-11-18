@@ -31,12 +31,42 @@ func (m *Manager) managedProxySelector() func(*http.Request) (*url.URL, error) {
 			}
 			return m.proxyPool.Select(host)
 		}
-		raw := m.GlobalProxy()
-		if raw == "" {
-			return nil, nil
+		// Preserve upstream's exact stored proxy behavior (including
+		// validation/rejection performed by SetUpstreamProxy) while the
+		// managed pool is disabled. Do not reparse a separate setting here.
+		if m.traffic != nil {
+			return m.traffic.ConfiguredUpstreamProxy(), nil
 		}
-		return url.Parse(raw)
+		return nil, nil
 	}
+}
+
+// managedWebFetchDialCheck is invoked before each WebFetch TCP connection.
+// When the pool is disabled it is a strict no-op: normal ARTEX's direct
+// retry and proxy behavior remain intact. When enabled, only the recording
+// proxy is a legal WebFetch dial destination, even for an already-running
+// agent created before the pool was enabled.
+func (m *Manager) managedWebFetchDialCheck(configuredProxyURL, dialAddress string) error {
+	if m.proxyPool == nil || !m.proxyPool.Enabled() {
+		return nil
+	}
+	if m.traffic == nil {
+		return errors.New("managed proxy pool requires a recording proxy")
+	}
+	expected, err := url.Parse(m.traffic.ProxyAddr())
+	if err != nil {
+		return errors.New("managed proxy pool recording proxy address invalid")
+	}
+	configured, err := url.Parse(configuredProxyURL)
+	if err != nil || configured.Scheme != expected.Scheme ||
+		!strings.EqualFold(configured.Host, expected.Host) ||
+		configured.Path != "" || configured.RawQuery != "" {
+		return errors.New("managed proxy pool blocks WebFetch from using a stale or alternate proxy route")
+	}
+	if !strings.EqualFold(dialAddress, expected.Host) {
+		return errors.New("managed proxy pool blocks WebFetch direct fallback")
+	}
+	return nil
 }
 
 // SetManagedProxyPool changes only a pool of manually-entered authorized proxies.

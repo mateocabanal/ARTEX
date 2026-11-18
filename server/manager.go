@@ -291,9 +291,10 @@ type Manager struct {
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
-	globalProxy     string
-	proxyPool       *managedproxy.Pool
-	proxyPoolCancel context.CancelFunc
+	globalProxy      string
+	proxyPool        *managedproxy.Pool
+	proxyPoolCancel  context.CancelFunc
+	proxyDialCleanup func()
 }
 
 // Settings keys the UI toggles at runtime.
@@ -532,6 +533,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		m.traffic.SetUpstreamSelector(m.managedProxySelector())
 		m.traffic.SetTargetPolicy(func(host string) error { return m.proxyPool.AllowHost(host) })
 	}
+	// Keep upstream ARTEX's WebFetch proxy retries unchanged unless this
+	// deployment explicitly enables the managed pool. In that mode, a stale
+	// agent's direct retry is rejected at the actual TCP dial, even if the
+	// agent was created before the toggle or still holds an old proxy URL.
+	m.proxyDialCleanup = agent.InstallManagedProxyDialGuard(m.managedWebFetchDialCheck)
 	// Do not accept traffic until the managed proxy policy has been loaded:
 	// a startup race here could otherwise send requests directly.
 	if tr := m.traffic; tr != nil {
@@ -920,6 +926,9 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	if m.proxyDialCleanup != nil {
+		m.proxyDialCleanup()
+	}
 	if m.proxyPoolCancel != nil {
 		m.proxyPoolCancel()
 	}

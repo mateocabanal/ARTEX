@@ -5,6 +5,10 @@ import (
 	"net/url"
 )
 
+// ConfiguredUpstreamProxy returns the existing single-upstream setting unchanged.
+// The Managed Proxy Pool must preserve this exact value when disabled.
+func (t *Traffic) ConfiguredUpstreamProxy() *url.URL { return t.upstream.Load() }
+
 // managedUpstreamSelector takes precedence over the legacy single upstream URL.
 // Selector errors are propagated; they are never converted into direct dialing.
 type managedUpstreamSelector struct {

@@ -470,6 +470,13 @@ The pool has no import/rotation of public proxy lists; it does not automatically
 apply to unproxied scanners/tools, and the target gate remains independently
 responsible for approval. See [Managed proxy pool](docs/MANAGED_PROXY_POOL.md).
 
+**Upstream compatibility:** Our fork keeps its extensions optional and the
+original ARTEX defaults intact; in particular, the original global proxy
+setting and WebFetch retry behavior are unchanged until the managed pool is
+enabled. See the [upstream compatibility policy](docs/UPSTREAM_COMPAT.md)
+and its on-demand upstream trial-merge smoke test.
+
+
 **Low-and-slow agent guidance (off by default)**: when a noise profile is set, the planner, worker,
 main agent and chat agents receive a code-owned prompt block with the profile's per-host limits and
 exact rate/delay flags for the installed scanners. It tells them to test one host at a time, back
